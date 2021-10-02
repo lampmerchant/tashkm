@@ -97,14 +97,16 @@ TX_SIZ2	equ	2	;Number of bytes to be transmitted minus one
 TX_SIZ1	equ	1	; "
 TX_SIZ0	equ	0	; "
 
-			;COLLISN:
-COL_KBD	equ	7	;Set when there was a collision on keyboard's address
-COL_MSE	equ	6	;Set when there was a collision on mouse's address
+			;DV_FLAGS:
+DV_KBDC	equ	7	;Set when there was a collision on keyboard's address
+DV_MSEC	equ	6	;Set when there was a collision on mouse's address
+DV_MSES	equ	4	;Set when the mouse needs service
 
 			;U_FLAGS:
 U_HEADR	equ	7	;Set when we've received and are working a header byte
 U_FWD	equ	6	;Set when we're just forwarding (not queuing) bytes
-U_CNTR3	equ	3	;Counter of bytes to forward or queue
+U_ISMSE	equ	5	;Set to receive for the mouse, clear for keyboard
+U_CNTR3	equ	3	;Counter of bytes to forward or act on
 U_CNTR2	equ	2	; "
 U_CNTR1	equ	1	; "
 U_CNTR0	equ	0	; "
@@ -137,20 +139,20 @@ KMD_ROP	equ	2	;Right Option
 	
 	RX_FLAGS	;Receiver flags
 	TX_FLAGS	;Transmitter flags
-	COLLISN		;Collision flags
+	DV_FLAGS	;Device flags
 	U_FLAGS		;UART flags
 	RX_TDOWN	;Time spent down in the last down-up transition
 	RX_TUP		;Time spent up in the last down-up transition
 	ADB_PTR		;Receiver/transmitter state machine pointer
 	ADB_CMD		;Receiver command buffer
 	ADB_BUF		;Receiver/transmitter buffer
-	ADB_BUF2	;2nd byte of transmitter buffer
-	ADB_BUF3	;3rd byte of transmitter buffer
-	ADB_BUF4	;4th byte of transmitter buffer
-	ADB_BUF5	;5th byte of transmitter buffer
-	ADB_BUF6	;6th byte of transmitter buffer
-	ADB_BUF7	;7th byte of transmitter buffer
-	ADB_BUF8	;8th byte of transmitter buffer
+	ADB_BUF2	;2nd byte of receiver/transmitter buffer
+	ADB_BUF3	;3rd byte of receiver/transmitter buffer
+	ADB_BUF4	;4th byte of receiver/transmitter buffer
+	ADB_BUF5	;5th byte of receiver/transmitter buffer
+	ADB_BUF6	;6th byte of receiver/transmitter buffer
+	ADB_BUF7	;7th byte of receiver/transmitter buffer
+	ADB_BUF8	;8th byte of receiver/transmitter buffer
 	
 	endc
 
@@ -161,6 +163,15 @@ KMD_ROP	equ	2	;Right Option
 	KBD_MODS	;Keyboard modifier key state
 	KBD_3_H		;Keyboard register 3 high byte
 	KBD_3_L		;Keyboard register 3 low byte
+	MSE_DXH		;Mouse with handler 1 delta X high byte
+	MSE_DXL		;Mouse with handler 1 delta X low byte
+	MSE_DYH		;Mouse with handler 1 delta Y high byte
+	MSE_DYL		;Mouse with handler 1 delta Y low byte
+	MS4_0_1		;Mouse with handler 4 register 0 first byte
+	MS4_0_2		;Mouse with handler 4 register 0 second byte
+	MS4_0_3		;Mouse with handler 4 register 0 third byte
+	MS4_0_4		;Mouse with handler 4 register 0 fourth byte
+	MS4_0_5		;Mouse with handler 4 register 0 fifth byte
 	MSE_3_H		;Mouse register 3 high byte
 	MSE_3_L		;Mouse register 3 low byte
 	
@@ -339,7 +350,7 @@ Init
 	movlw	B'11110000'
 	movwf	OSCCON
 	
-	banksel	IOCAN		;RA5 sets IOCAN[5] on negative edge
+	banksel	IOCAN		;RA5 sets IOCAF[5] on negative edge
 	movlw	B'00100000'
 	movwf	IOCAN
 	
@@ -383,15 +394,15 @@ Init
 	movlw	0x01
 	movwf	MSE_3_L
 	
-	movlw	0x20		;Set up UART receiver queue (0x2000-0x207F),
-	movwf	FSR0H		; for which FSRs are push (FSR0) and pop (FSR1)
+	movlw	0x20		;Set up keyboard queue (0x2000-0x207F), for
+	movwf	FSR0H		; which FSRs are push (FSR0) and pop (FSR1)
 	movwf	FSR1H		; pointers
 	clrf	FSR0L
 	clrf	FSR1L
 	
 	clrf	TX_FLAGS	;Particularly important that these are zero
 	clrf	RX_FLAGS
-	clrf	COLLISN
+	clrf	DV_FLAGS
 	clrf	U_FLAGS
 	clrf	ADB_PTR
 	
@@ -405,18 +416,110 @@ GotUartByte
 	bra	GUNewHeader	; "
 	btfsc	U_FLAGS,U_FWD	;If we're forwarding bytes, forward this one,
 	bra	GUForwardByte	; else queue it
+	btfsc	U_FLAGS,U_ISMSE	;If this byte is for the mouse, interpret it
+	bra	GUMouseByte	; as such, otherwise interpret for keyboard
 	;fall through
 
-GUQueueByte
+GUKeyboardByte
 	movlb	3		;Push the byte that came in over the UART onto
-	movf	RCREG,W		; the receiver queue
+	movf	RCREG,W		; the keyboard queue
 	movwi	FSR0++		; "
 	bcf	FSR0L,7		; "
-	decf	U_FLAGS,F	;Decrement the counter in the UART flags
-	movf	U_FLAGS,W	;If the counter has reached zero, lower all
-	andlw	B'00001111'	; flags and await a new header byte
-	btfsc	STATUS,Z	; "
-	clrf	U_FLAGS		; "
+	clrf	U_FLAGS		;Keyboard packet done, await new header
+	bra	Main
+
+GUMouseByte
+	bcf	DV_FLAGS,DV_MSES;Don't signal for service, data may not be done
+	movf	U_FLAGS,W	;Branch into one of the following depending on
+	andlw	B'00000111'	; the remaining-bytes counter to determine how
+	brw			; to interpret this one for the mouse:
+	nop			;(0) This shouldn't happen, fall through to...
+	bra	GUMouseH4_5	;(1) Finish with fifth byte of handler 4 reg 0
+	bra	GUMouseH4_4	;(2) Store as fourth byte of handler 4 reg 0
+	bra	GUMouseH4_3	;(3) Store as third byte of handler 4 reg 0
+	bra	GUMouseH4_2	;(4) Store as second byte of handler 4 reg 0
+	bra	GUMouseH4_1	;(5) Store as first byte of handler 4 reg 0
+	bra	GUMouseDeltaX	;(6) Add to the X delta for handler 1 reg 0
+	bra	GUMouseDeltaY	;(7) Add to the Y delta for handler 1 reg 0
+
+GUMouseH4_5
+	movlw	B'01110111'	;Set the mouse position bits to 1s so we can
+	movlb	1		; overwrite them using AND and leave the mouse
+	iorwf	MS4_0_5,F	; buttons down if they were ever down
+	movlb	3		;Store the byte that came in over the UART as
+	movf	RCREG,W		; the fifth byte of the reply to a talk reg 0
+	movlb	1		; for a mouse with handler set to 4
+	andwf	MS4_0_5,F	; "
+	bsf	DV_FLAGS,DV_MSES;Signal that the mouse needs service
+	clrf	U_FLAGS		;Mouse packet done, await new header
+	bra	Main
+
+GUMouseH4_4
+	movlw	B'01110111'	;Set the mouse position bits to 1s so we can
+	movlb	1		; overwrite them using AND and leave the mouse
+	iorwf	MS4_0_4,F	; buttons down if they were ever down
+	movlb	3		;Store the byte that came in over the UART as
+	movf	RCREG,W		; the fourth byte of the reply to a talk reg 0
+	movlb	1		; for a mouse with handler set to 4
+	andwf	MS4_0_4,F	; "
+	decf	U_FLAGS,F	;Decrement remaining-bytes counter
+	bra	Main
+
+GUMouseH4_3
+	movlw	B'01110111'	;Set the mouse position bits to 1s so we can
+	movlb	1		; overwrite them using AND and leave the mouse
+	iorwf	MS4_0_3,F	; buttons down if they were ever down
+	movlb	3		;Store the byte that came in over the UART as
+	movf	RCREG,W		; the third byte of the reply to a talk reg 0
+	movlb	1		; for a mouse with handler set to 4
+	andwf	MS4_0_3,F	; "
+	decf	U_FLAGS,F	;Decrement remaining-bytes counter
+	bra	Main
+
+GUMouseH4_2
+	movlw	B'01111111'	;Set the mouse position bits to 1s so we can
+	movlb	1		; overwrite them using AND and leave the mouse
+	iorwf	MS4_0_2,F	; buttons down if they were ever down
+	movlb	3		;Store the byte that came in over the UART as
+	movf	RCREG,W		; the second byte of the reply to a talk reg 0
+	movlb	1		; for a mouse with handler set to 4
+	andwf	MS4_0_2,F	; "
+	decf	U_FLAGS,F	;Decrement remaining-bytes counter
+	bra	Main
+
+GUMouseH4_1
+	movlw	B'01111111'	;Set the mouse position bits to 1s so we can
+	movlb	1		; overwrite them using AND and leave the mouse
+	iorwf	MS4_0_1,F	; buttons down if they were ever down
+	movlb	3		;Store the byte that came in over the UART as
+	movf	RCREG,W		; the first byte of the reply to a talk reg 0
+	movlb	1		; for a mouse with handler set to 4
+	andwf	MS4_0_1,F	; "
+	decf	U_FLAGS,F	;Decrement remaining-bytes counter
+	bra	Main
+
+GUMouseDeltaX
+	movlb	3		;Grab the byte that came in over the UART
+	movf	RCREG,W		; "
+	movlb	1		;Add it to the low byte of the 16-bit delta X
+	addwf	MSE_DXL,F	; counter
+	iorlw	B'01111111'	;Sign-extend the byte and add this to the high
+	btfss	WREG,7		; byte of the 16-bit delta X counter
+	movlw	0		; "
+	addwfc	MSE_DXH,F	; "
+	decf	U_FLAGS,F	;Decrement remaining-bytes counter
+	bra	Main
+
+GUMouseDeltaY
+	movlb	3		;Grab the byte that came in over the UART
+	movf	RCREG,W		; "
+	movlb	1		;Add it to the low byte of the 16-bit delta Y
+	addwf	MSE_DYL,F	; counter
+	iorlw	B'01111111'	;Sign-extend the byte and add this to the high
+	btfss	WREG,7		; byte of the 16-bit delta Y counter
+	movlw	0		; "
+	addwfc	MSE_DYH,F	; "
+	decf	U_FLAGS,F	;Decrement remaining-bytes counter
 	bra	Main
 
 GUForwardByte
@@ -433,32 +536,34 @@ GUForwardByte
 GUNewHeader
 	movlb	3		;Grab the byte that came in over the UART
 	movf	RCREG,W		; "
-	btfsc	WREG,7		;If any of its address bits are set, then we
-	bra	GUForwardHeader	; need to forward it
-	btfsc	WREG,6		; "
-	bra	GUForwardHeader	; "
-	btfsc	WREG,5		; "
-	bra	GUForwardHeader	; "
+	btfss	WREG,7		;All header bytes have MSB set; if it's clear,
+	clrf	TXREG		; relay a zero; this way the host can send a
+	btfss	WREG,7		; string of zero bytes to get all units to a
+	bra	Main		; known state
+	bsf	U_FLAGS,U_HEADR	;Raise the flag that we have a header byte
+	bsf	U_FLAGS,U_CNTR0	;We'll be receiving at least one byte
+	btfsc	WREG,6		;If bit 6 of the header byte is set, this is a
+	bsf	U_FLAGS,U_ISMSE	; mouse packet, so raise that flag
+	btfsc	WREG,6		;If we're receiving a mouse packet, it has
+	bsf	U_FLAGS,U_CNTR1	; seven bytes, so add six to the counter in the
+	btfsc	WREG,6		; flags register
+	bsf	U_FLAGS,U_CNTR2	; "
+	btfsc	WREG,5		;If any of the incoming byte's address bits are
+	bsf	U_FLAGS,U_FWD	; set, then we need to forward it
 	btfsc	WREG,4		; "
-	bra	GUForwardHeader	; "
-	movwi	FSR0++		;Its address counter is zero, so push it onto
-	bcf	FSR0L,7		; the receiver queue as is
-	andlw	B'00000111'	;Mask off its counter, increment it by one to
-	incf	WREG,W		; adjust it to be a normal countdown of bytes,
-	iorlw	B'10000000'	; set the have-header flag, and store this as
-	movwf	U_FLAGS		; the new value of UART flags register
-	bra	Main
-
-GUForwardHeader
-	swapf	WREG,W		;Decrement the address counter so we can send
-	decf	WREG,W		; this packet forward to its intended
-	swapf	WREG,W		; recipient
-	movlb	3		;Send the header byte forward with decremented
-	movwf	TXREG		; address counter
-	andlw	B'00000111'	;Mask off its counter, increment it by one to
-	incf	WREG,W		; adjust it to be a normal countdown of bytes,
-	iorlw	B'11000000'	; set the have-header and forward flags, and
-	movwf	U_FLAGS		; store this as the new value of UART flags reg
+	bsf	U_FLAGS,U_FWD	; "
+	btfsc	WREG,3		; "
+	bsf	U_FLAGS,U_FWD	; "
+	btfsc	WREG,2		; "
+	bsf	U_FLAGS,U_FWD	; "
+	btfsc	WREG,1		; "
+	bsf	U_FLAGS,U_FWD	; "
+	btfsc	WREG,0		; "
+	bsf	U_FLAGS,U_FWD	; "
+	btfss	U_FLAGS,U_FWD	;If we're not forwarding, we're done here
+	bra	Main		; "
+	decf	WREG,W		;Decrement the address and then pass the header
+	movwf	TXREG		; byte forward to the next device
 	bra	Main
 
 GotReset
@@ -501,22 +606,6 @@ GotCmd
 	call	ServiceRequest	; "
 	bra	Main
 
-Main
-	movlb	0
-	btfsc	PIR1,RCIF
-	bra	GotUartByte
-	btfsc	RX_FLAGS,RX_RST
-	bra	GotReset
-	btfsc	RX_FLAGS,RX_CMD
-	bra	GotCmd
-	btfsc	RX_FLAGS,RX_DATA
-	bra	GotData
-	btfsc	RX_FLAGS,RX_ABRT
-	bra	GotDataEnd
-	btfsc	TX_FLAGS,TX_COL
-	bra	GotCollision
-	bra	Main
-
 KeyboardTalk
 	movf	ADB_CMD,W	;If this is a talk register 0, handle that
 	andlw	B'00000011'	; "
@@ -531,71 +620,27 @@ KeyboardTalk
 	bra	KeyboardTalk3	;Else it's a talk register 3, handle that
 
 KeyboardTalk0
-	movf	FSR0L,W		;If the UART receiver queue is empty, we have
-	xorwf	FSR1L,W		; no data for either mouse or keyboard, so bail
+	btfsc	DV_FLAGS,DV_MSES;If the mouse needs service, effect a service
+	call	ServiceRequest	; request condition so the computer polls it
+	movf	FSR0L,W		;If the keyboard queue is empty, we have no
+	xorwf	FSR1L,W		; data, so bail
 	btfsc	STATUS,Z	; "
 	bra	Main		; "
-	btfsc	INDF1,3		;If the byte on the top of the queue has bit 3
-	call	ServiceRequest	; set (mouse data) effect a service request
-	btfsc	INDF1,3		; condition and send no data so the computer
-	bra	Main		; polls the mouse instead
-	;fall through
-
-Talk0FromQueue
-	movlw	B'11111000'	;Zero the counter of bytes to transmit
-	andwf	TX_FLAGS,F	; "
-	moviw	FSR1++		;Pop the control byte off the top of the queue
-	bcf	FSR1L,7		; and keep only its bottom three bits (length
-	andlw	B'00000111'	; of transmission minus one)
-	iorwf	TX_FLAGS,F	;Copy its length field into the transmit count
-	movwf	ADB_BUF8	; and use the last buffer byte as a counter
-	moviw	FSR1++		;Move the first data byte from the queue into
-	bcf	FSR1L,7		; the ADB buffer
-	movwf	ADB_BUF		; "
-	bsf	TX_FLAGS,TX_RDY	;Signal that we're ready to transmit
-	movf	ADB_BUF8,F	;If the byte counter is zero, then we only had
-	btfsc	STATUS,Z	; one byte of data (this shouldn't happen) to
-	bra	Main		; transmit and we're done
-	moviw	FSR1++		;Move the second data byte from the queue into
-	bcf	FSR1L,7		; the ADB buffer
-	movwf	ADB_BUF2	; "
-	decf	ADB_BUF8,F	;Decrement the byte counter; if it is now zero,
-	btfsc	STATUS,Z	; we had two bytes of data to transmit and
-	bra	Main		; we're done
-	moviw	FSR1++		;Move the third data byte from the queue into
-	bcf	FSR1L,7		; the ADB buffer
-	movwf	ADB_BUF3	; "
-	decf	ADB_BUF8,F	;Decrement the byte counter; if it is now zero,
-	btfsc	STATUS,Z	; we had three bytes of data to transmit and
-	bra	Main		; we're done
-	moviw	FSR1++		;Move the fourth data byte from the queue into
-	bcf	FSR1L,7		; the ADB buffer
-	movwf	ADB_BUF4	; "
-	decf	ADB_BUF8,F	;Decrement the byte counter; if it is now zero,
-	btfsc	STATUS,Z	; we had four bytes of data to transmit and
-	bra	Main		; we're done
-	moviw	FSR1++		;Move the fifth data byte from the queue into
-	bcf	FSR1L,7		; the ADB buffer
-	movwf	ADB_BUF5	; "
-	decf	ADB_BUF8,F	;Decrement the byte counter; if it is now zero,
-	btfsc	STATUS,Z	; we had five bytes of data to transmit and
-	bra	Main		; we're done
-	moviw	FSR1++		;Move the sixth data byte from the queue into
-	bcf	FSR1L,7		; the ADB buffer
-	movwf	ADB_BUF6	; "
-	decf	ADB_BUF8,F	;Decrement the byte counter; if it is now zero,
-	btfsc	STATUS,Z	; we had six bytes of data to transmit and
-	bra	Main		; we're done
-	moviw	FSR1++		;Move the seventh data byte from the queue into
-	bcf	FSR1L,7		; the ADB buffer
-	movwf	ADB_BUF7	; "
-	decf	ADB_BUF8,F	;Decrement the byte counter; if it is now zero,
-	btfsc	STATUS,Z	; we had seven bytes of data to transmit and
-	bra	Main		; we're done
-	moviw	FSR1++		;Move the eighth data byte from the queue into
-	bcf	FSR1L,7		; the ADB buffer
-	movwf	ADB_BUF8	; "
-	bra	Main		;Can't have more than eight, so we're done
+	moviw	FSR1++		;Pop the next keyboard code off the queue
+	bcf	FSR1L,7		; "
+	movwf	ADB_BUF		;Copy it into the ADB buffer
+	clrf	ADB_BUF2	;Put the customary 0xFF into the second byte of
+	decf	ADB_BUF2,F	; the ADB buffer
+	xorlw	0x7F		;If the keyboard code was 0x7F, the reset key,
+	btfsc	STATUS,Z	; we need to put it in both bytes of what we
+	bcf	ADB_BUF2,7	; send to the computer
+	xorlw	0x7F		;Update keyboard register 2 according to this
+	call	UpdateKeyboard2	; key press or release
+	bsf	TX_FLAGS,TX_RDY	;Set up the transmitter flags so we signal that
+	bcf	TX_FLAGS,TX_SIZ2; we're ready to transmit two bytes
+	bcf	TX_FLAGS,TX_SIZ1; "
+	bsf	TX_FLAGS,TX_SIZ0; "
+	bra	Main
 
 KeyboardTalk2
 	movlb	1		;Move the contents of keyboard register 2 into
@@ -633,24 +678,171 @@ MouseTalk
 	andlw	B'00000011'	; "
 	btfsc	STATUS,Z	; "
 	bra	MouseTalk0	; "
-	addlw	-1		;If this is a talk register 1, we have no
-	btfsc	STATUS,Z	; handler for that, so done
-	bra	Main		; "
+	addlw	-1		;If this is a talk register 1, handle that
+	btfsc	STATUS,Z	; "
+	bra	MouseTalk1	; "
 	addlw	-1		;If this is a talk register 2, we have no
 	btfsc	STATUS,Z	; handler for that, so done
 	bra	Main		; "
 	bra	MouseTalk3	;Else it's a talk register 3, handle that
 
+Main
+	movlb	0
+	btfsc	PIR1,RCIF
+	bra	GotUartByte
+	btfsc	RX_FLAGS,RX_RST
+	bra	GotReset
+	btfsc	RX_FLAGS,RX_CMD
+	bra	GotCmd
+	btfsc	RX_FLAGS,RX_DATA
+	bra	GotData
+	btfsc	RX_FLAGS,RX_ABRT
+	bcf	RX_FLAGS,RX_ABRT
+	btfsc	TX_FLAGS,TX_COL
+	bra	GotCollision
+	bra	Main
+
 MouseTalk0
-	movf	FSR0L,W		;If the UART receiver queue is empty, we have
-	xorwf	FSR1L,W		; no data for either mouse or keyboard, so bail
-	btfsc	STATUS,Z	; "
+	movf	FSR0L,W		;If the keyboard queue is not empty, we have
+	xorwf	FSR1L,W		; data for the keyboard, so effect a service
+	btfss	STATUS,Z	; request so the computer knows to poll the
+	call	ServiceRequest	; keyboard
+	btfss	DV_FLAGS,DV_MSES;If the mouse doesn't need service, we're done
 	bra	Main		; "
-	btfss	INDF1,3		;If the byte on the top of the queue has bit 3
-	call	ServiceRequest	; clear (keyboard data) effect a service
-	btfss	INDF1,3		; request condition and send no data so the
-	bra	Main		; computer polls the keyboard instead
-	bra	Talk0FromQueue
+	bcf	DV_FLAGS,DV_MSES;Clear the mouse-needs-service flag
+	movlb	1		;If our handler ID is set to 4, reply using the
+	movf	MSE_3_L,W	; literal bytes last handed to us by the host,
+	xorlw	4		; else use the classic mouse protocol to hand
+	btfsc	STATUS,Z	; over a delta Y and a delta X
+	bra	MouseTalk0_H4	; "
+	;fall through
+
+MouseTalk0_H1
+MT0Y	movlb	1		;We handle the Y delta differently depending on
+	btfsc	MSE_DYH,7	; whether it's negative or positive
+	bra	MT0YNeg		; "
+MT0YPos	movlw	0xC1		;If it's positive, subtract 63 from it
+	addwf	MSE_DYL,F	; "
+	movlw	0xFF		; "
+	addwfc	MSE_DYH,F	; "
+	btfsc	STATUS,C	;If it didn't borrow, leave the difference,
+	bra	MT0YPMo		; it's more than we can convey in one delta
+	movlw	B'00111111'	;If it borrowed, add 63 to the difference and
+	addwf	MSE_DYL,W	; that's our final delta
+	movwf	ADB_BUF		; "
+	clrf	MSE_DYH		; "
+	clrf	MSE_DYL		; "
+	bra	MT0X		;Go to handle the X delta
+MT0YPMo	movlw	B'00111111'	;If it didn't borrow, send the delta 63 and
+	movwf	ADB_BUF		; signal that we need to be serviced again to
+	bsf	DV_FLAGS,DV_MSES; convey the rest of it
+	bra	MT0X		;Go to handle the X delta
+MT0YNeg	movlw	0x40		;If it's negative, add 64 to it
+	addwf	MSE_DYL,F	; "
+	movlw	0		; "
+	addwfc	MSE_DYH,F	; "
+	btfss	STATUS,C	;If it didn't overflow, leave the sum, it's
+	bra	MT0YNMo		; more than we can convey in one delta
+	movlw	B'01000000'	;If it overflowed, add -64 to the sum and
+	addwf	MSE_DYL,W	; that's our final delta
+	movwf	ADB_BUF		; "
+	clrf	MSE_DYL		; "
+	bra	MT0X		;Go to handle the X delta
+MT0YNMo	movlw	B'01000000'	;If it didn't overflow, send the delta -64 and
+	movwf	ADB_BUF		; signal that we need to be serviced again to
+	bsf	DV_FLAGS,DV_MSES; convey the rest of it
+MT0X	btfsc	MSE_DXH,7	;We handle the X delta differently depending on
+	bra	MT0XNeg		; whether it's negative or positive
+MT0XPos	movlw	0xC1		;If it's positive, subtract 63 from it
+	addwf	MSE_DXL,F	; "
+	movlw	0xFF		; "
+	addwfc	MSE_DXH,F	; "
+	btfsc	STATUS,C	;If it didn't borrow, leave the difference,
+	bra	MT0XPMo		; it's more than we can convey in one delta
+	movlw	B'00111111'	;If it borrowed, add 63 to the difference and
+	addwf	MSE_DXL,W	; that's our final delta
+	movwf	ADB_BUF2	; "
+	clrf	MSE_DXH		; "
+	clrf	MSE_DXL		; "
+	bra	MT0Btns		;Go to handle the X delta
+MT0XPMo	movlw	B'00111111'	;If it didn't borrow, send the delta 63 and
+	movwf	ADB_BUF2	; signal that we need to be serviced again to
+	bsf	DV_FLAGS,DV_MSES; convey the rest of it
+	bra	MT0Btns		;Go to handle the X delta
+MT0XNeg	movlw	0x40		;If it's negative, add 64 to it
+	addwf	MSE_DXL,F	; "
+	movlw	0		; "
+	addwfc	MSE_DXH,F	; "
+	btfss	STATUS,C	;If it didn't overflow, leave the sum, it's
+	bra	MT0XNMo		; more than we can convey in one delta
+	movlw	B'01000000'	;If it overflowed, add -64 to the sum and
+	addwf	MSE_DXL,W	; that's our final delta
+	movwf	ADB_BUF2	; "
+	clrf	MSE_DXL		; "
+	bra	MT0Btns		;Go to handle the X delta
+MT0XNMo	movlw	B'01000000'	;If it didn't overflow, send the delta -64 and
+	movwf	ADB_BUF2	; signal that we need to be serviced again to
+	bsf	DV_FLAGS,DV_MSES; convey the rest of it
+MT0Btns	btfsc	MS4_0_1,7	;Copy the mouse button bits from the handler 4
+	bsf	ADB_BUF,7	; data
+	btfsc	MS4_0_2,7	; "
+	bsf	ADB_BUF2,7	; "
+	bsf	TX_FLAGS,TX_RDY	;Signal the transmitter that we're ready to
+	bcf	TX_FLAGS,TX_SIZ2; transmit two bytes
+	bcf	TX_FLAGS,TX_SIZ1; "
+	bsf	TX_FLAGS,TX_SIZ0; "
+	movlw	B'11111111'	;Overwrite the bytes for handler 4 register 0
+	movwf	MS4_0_1		; with ones so the mouse buttons can be
+	movwf	MS4_0_2		; released
+	movwf	MS4_0_3		; "
+	movwf	MS4_0_4		; "
+	movwf	MS4_0_5		; "
+	bra	Main
+
+MouseTalk0_H4
+	movf	MS4_0_1,W	;Copy the bytes for register 0 last handed to
+	movwf	ADB_BUF		; us by the host into the ADB buffer
+	movf	MS4_0_2,W	; "
+	movwf	ADB_BUF2	; "
+	movf	MS4_0_3,W	; "
+	movwf	ADB_BUF3	; "
+	movf	MS4_0_4,W	; "
+	movwf	ADB_BUF4	; "
+	movf	MS4_0_5,W	; "
+	movwf	ADB_BUF5	; "
+	movlw	B'11111111'	;Overwrite the bytes for register 0 with ones
+	movwf	MS4_0_1		; so the mouse buttons can be released
+	movwf	MS4_0_2		; "
+	movwf	MS4_0_3		; "
+	movwf	MS4_0_4		; "
+	movwf	MS4_0_5		; "
+	bsf	TX_FLAGS,TX_RDY	;Signal the transmitter that we're ready to
+	bsf	TX_FLAGS,TX_SIZ2; transmit five bytes
+	bcf	TX_FLAGS,TX_SIZ1; "
+	bcf	TX_FLAGS,TX_SIZ0; "
+	bra	Main
+
+MouseTalk1
+	movlb	1		;If our handler ID is not set to 4, we have no
+	movf	MSE_3_L,W	; register 1 to talk, so we're done
+	xorlw	4		; "
+	btfss	STATUS,Z	; "
+	bra	Main		; "
+	movlw	0		;We have no unique identifier as assigned by
+	movwf	ADB_BUF		; Apple, so give all zeroes instead
+	movwf	ADB_BUF2	; "
+	movwf	ADB_BUF3	; "
+	movwf	ADB_BUF4	; "
+	movwf	ADB_BUF5	;Our device resolution is nominally 96 units
+	movlw	96		; per inch, pretend we are a graphics tablet
+	movwf	ADB_BUF6	; the exact size of the mac's monitor
+	movlw	0		;We are a graphics tablet, absolute positioned
+	movwf	ADB_BUF7	; "
+	movlw	8		;And we have 8 buttons
+	movwf	ADB_BUF8	; "
+	movlw	B'10000111'	;Signal that we're ready to transmit 8 bytes
+	iorwf	TX_FLAGS,F	; "
+	bra	Main
 
 MouseTalk3
 	movlb	1		;Move the high byte of mouse register 3 into
@@ -718,7 +910,7 @@ KeyboardL3_00
 	bra	Main
 
 KeyboardL3_FE
-	btfsc	COLLISN,COL_KBD	;If there was a collision, do not change the
+	btfsc	DV_FLAGS,DV_KBDC;If there was a collision, do not change the
 	bra	KL3FENo		; address
 	movlw	B'00001111'	;Snuff the top nibble of the first data byte,
 	andwf	ADB_BUF,F	; we don't care about those bits
@@ -727,7 +919,7 @@ KeyboardL3_FE
 	andlw	B'11110000'	; "
 	iorwf	ADB_BUF,W	; "
 	movwf	KBD_3_H		; "
-KL3FENo	bcf	COLLISN,COL_KBD	;Clear the collision flag if it was set
+KL3FENo	bcf	DV_FLAGS,DV_KBDC;Clear the collision flag if it was set
 	bra	Main
 
 KeyboardL3ChgH
@@ -748,6 +940,12 @@ MouseListen
 	addlw	2		;If the low byte of the listen register 3 data
 	btfsc	STATUS,Z	; is 0xFE, handle this
 	bra	MouseL3_FE	; "
+	addlw	250		;If the low byte of the listen register 3 data
+	btfsc	STATUS,Z	; is 0x01 or 0x04, these are handler IDs that
+	bra	MouseL3ChgH	; we (as an extended mouse) understand, so
+	addlw	3		; change our handler ID accordingly
+	btfsc	STATUS,Z	; "
+	bra	MouseL3ChgH	; "
 	bra	Main
 
 MouseL3_00
@@ -757,7 +955,7 @@ MouseL3_00
 	bra	Main
 
 MouseL3_FE
-	btfsc	COLLISN,COL_MSE	;If there was a collision, do not change the
+	btfsc	DV_FLAGS,DV_MSEC;If there was a collision, do not change the
 	bra	ML3FENo		; address
 	movlw	B'00001111'	;Snuff the top nibble of the first data byte,
 	andwf	ADB_BUF,F	; we don't care about those bits
@@ -766,7 +964,13 @@ MouseL3_FE
 	andlw	B'11110000'	; "
 	iorwf	ADB_BUF,W	; "
 	movwf	MSE_3_H		; "
-ML3FENo	bcf	COLLISN,COL_MSE	;Clear the collision flag if it was set
+ML3FENo	bcf	DV_FLAGS,DV_MSEC;Clear the collision flag if it was set
+	bra	Main
+
+MouseL3ChgH
+	movf	ADB_BUF2,W	;Change our handler ID (the low byte of
+	movlb	1		; register 3) to the byte given in the listen
+	movwf	MSE_3_L		; register 3 command
 	bra	Main
 
 GotCollision
@@ -776,17 +980,13 @@ GotCollision
 	xorwf	KBD_3_H,W	; match, this is a collision on the keyboard's
 	andlw	B'00001111'	; address
 	btfsc	STATUS,Z	; "
-	bsf	COLLISN,COL_KBD	; "
+	bsf	DV_FLAGS,DV_KBDC; "
 	swapf	ADB_CMD,W	;Compare the address of the last command with
 	xorwf	MSE_3_H,W	; the stored address for the mouse; if they
 	andlw	B'00001111'	; match, this is a collision on the mouse's
 	btfsc	STATUS,Z	; address
-	bsf	COLLISN,COL_MSE	; "
-	bra	Main
-
-GotDataEnd
-	bcf	RX_FLAGS,RX_ABRT
-	bra	Main
+	bsf	DV_FLAGS,DV_MSEC; "
+	goto	Main
 
 
 ;;; Subprograms ;;;
@@ -802,6 +1002,11 @@ ServiceRequest
 	movlw	B'11011111'	; "
 	andwf	TRISA,F		; "
 	return
+
+UpdateKeyboard2
+	btfsc	WREG,7		;If MSB is set, a key has been released, else
+	bra	Update2KeyUp	; one has been pressed
+	;fall through
 
 Update2KeyDown
 	addlw	-51		;0x33 Delete/Backspace
@@ -840,7 +1045,7 @@ Update2KeyDown
 	addlw	-2		;0x7F Reset
 	btfsc	STATUS,Z	; if keycode matches,
 	bcf	KBD_2_H,K2H_RST	; mark key as down
-	return
+	bra	Update2Mods
 
 Update2KeyUp
 	andlw	B'01111111'	;Clear MSB so we can check released key's code
@@ -880,7 +1085,7 @@ Update2KeyUp
 	addlw	-2		;0x7F Reset
 	btfsc	STATUS,Z	; if keycode matches,
 	bsf	KBD_2_H,K2H_RST	; mark key as up
-	return
+	;fall through
 
 Update2Mods
 	bsf	KBD_2_H,K2H_CTL	;If either control key is down, reflect that in
