@@ -163,15 +163,11 @@ KMD_ROP	equ	2	;Right Option
 	KBD_MODS	;Keyboard modifier key state
 	KBD_3_H		;Keyboard register 3 high byte
 	KBD_3_L		;Keyboard register 3 low byte
-	MSE_DXH		;Mouse with handler 1 delta X high byte
-	MSE_DXL		;Mouse with handler 1 delta X low byte
-	MSE_DYH		;Mouse with handler 1 delta Y high byte
-	MSE_DYL		;Mouse with handler 1 delta Y low byte
-	MS4_0_1		;Mouse with handler 4 register 0 first byte
-	MS4_0_2		;Mouse with handler 4 register 0 second byte
-	MS4_0_3		;Mouse with handler 4 register 0 third byte
-	MS4_0_4		;Mouse with handler 4 register 0 fourth byte
-	MS4_0_5		;Mouse with handler 4 register 0 fifth byte
+	MSE_DXH		;Mouse delta X high byte
+	MSE_DXL		;Mouse delta X low byte
+	MSE_DYH		;Mouse delta Y high byte
+	MSE_DYL		;Mouse delta Y low byte
+	MSE_BTN		;Mouse buttons
 	MSE_3_H		;Mouse register 3 high byte
 	MSE_3_L		;Mouse register 3 low byte
 	
@@ -431,71 +427,20 @@ GUKeyboardByte
 GUMouseByte
 	bcf	DV_FLAGS,DV_MSES;Don't signal for service, data may not be done
 	movf	U_FLAGS,W	;Branch into one of the following depending on
-	andlw	B'00000111'	; the remaining-bytes counter to determine how
-	brw			; to interpret this one for the mouse:
+	andlw	B'00000011'	; the remaining-bytes counter to determine how
+	brw			; to interpret this byte for the mouse:
 	nop			;(0) This shouldn't happen, fall through to...
-	bra	GUMouseH4_5	;(1) Finish with fifth byte of handler 4 reg 0
-	bra	GUMouseH4_4	;(2) Store as fourth byte of handler 4 reg 0
-	bra	GUMouseH4_3	;(3) Store as third byte of handler 4 reg 0
-	bra	GUMouseH4_2	;(4) Store as second byte of handler 4 reg 0
-	bra	GUMouseH4_1	;(5) Store as first byte of handler 4 reg 0
-	bra	GUMouseDeltaX	;(6) Add to the X delta for handler 1 reg 0
-	bra	GUMouseDeltaY	;(7) Add to the Y delta for handler 1 reg 0
+	bra	GUMouseButtons	;(1) Finish with the mouse buttons
+	bra	GUMouseDeltaX	;(2) Add to the mouse X delta
+	bra	GUMouseDeltaY	;(3) Add to the mouse Y delta
 
-GUMouseH4_5
-	movlw	B'01110111'	;Set the mouse position bits to 1s so we can
-	movlb	1		; overwrite them using AND and leave the mouse
-	iorwf	MS4_0_5,F	; buttons down if they were ever down
-	movlb	3		;Store the byte that came in over the UART as
-	movf	RCREG,W		; the fifth byte of the reply to a talk reg 0
-	movlb	1		; for a mouse with handler set to 4
-	andwf	MS4_0_5,F	; "
+GUMouseButtons
+	movlb	3		;Grab the byte that came in over the UART
+	movf	RCREG,W		; "
+	movlb	1		;AND it with the current state of mouse buttons
+	andwf	MSE_BTN,F	; so that clicks are always registered
 	bsf	DV_FLAGS,DV_MSES;Signal that the mouse needs service
 	clrf	U_FLAGS		;Mouse packet done, await new header
-	bra	Main
-
-GUMouseH4_4
-	movlw	B'01110111'	;Set the mouse position bits to 1s so we can
-	movlb	1		; overwrite them using AND and leave the mouse
-	iorwf	MS4_0_4,F	; buttons down if they were ever down
-	movlb	3		;Store the byte that came in over the UART as
-	movf	RCREG,W		; the fourth byte of the reply to a talk reg 0
-	movlb	1		; for a mouse with handler set to 4
-	andwf	MS4_0_4,F	; "
-	decf	U_FLAGS,F	;Decrement remaining-bytes counter
-	bra	Main
-
-GUMouseH4_3
-	movlw	B'01110111'	;Set the mouse position bits to 1s so we can
-	movlb	1		; overwrite them using AND and leave the mouse
-	iorwf	MS4_0_3,F	; buttons down if they were ever down
-	movlb	3		;Store the byte that came in over the UART as
-	movf	RCREG,W		; the third byte of the reply to a talk reg 0
-	movlb	1		; for a mouse with handler set to 4
-	andwf	MS4_0_3,F	; "
-	decf	U_FLAGS,F	;Decrement remaining-bytes counter
-	bra	Main
-
-GUMouseH4_2
-	movlw	B'01111111'	;Set the mouse position bits to 1s so we can
-	movlb	1		; overwrite them using AND and leave the mouse
-	iorwf	MS4_0_2,F	; buttons down if they were ever down
-	movlb	3		;Store the byte that came in over the UART as
-	movf	RCREG,W		; the second byte of the reply to a talk reg 0
-	movlb	1		; for a mouse with handler set to 4
-	andwf	MS4_0_2,F	; "
-	decf	U_FLAGS,F	;Decrement remaining-bytes counter
-	bra	Main
-
-GUMouseH4_1
-	movlw	B'01111111'	;Set the mouse position bits to 1s so we can
-	movlb	1		; overwrite them using AND and leave the mouse
-	iorwf	MS4_0_1,F	; buttons down if they were ever down
-	movlb	3		;Store the byte that came in over the UART as
-	movf	RCREG,W		; the first byte of the reply to a talk reg 0
-	movlb	1		; for a mouse with handler set to 4
-	andwf	MS4_0_1,F	; "
-	decf	U_FLAGS,F	;Decrement remaining-bytes counter
 	bra	Main
 
 GUMouseDeltaX
@@ -544,10 +489,8 @@ GUNewHeader
 	bsf	U_FLAGS,U_CNTR0	;We'll be receiving at least one byte
 	btfsc	WREG,6		;If bit 6 of the header byte is set, this is a
 	bsf	U_FLAGS,U_ISMSE	; mouse packet, so raise that flag
-	btfsc	WREG,6		;If we're receiving a mouse packet, it has
-	bsf	U_FLAGS,U_CNTR1	; seven bytes, so add six to the counter in the
-	btfsc	WREG,6		; flags register
-	bsf	U_FLAGS,U_CNTR2	; "
+	btfsc	WREG,6		;If receiving a mouse packet, it has 3 bytes so
+	bsf	U_FLAGS,U_CNTR1	; add 2 to the counter in the flags register
 	btfsc	WREG,5		;If any of the incoming byte's address bits are
 	bsf	U_FLAGS,U_FWD	; set, then we need to forward it
 	btfsc	WREG,4		; "
@@ -600,9 +543,10 @@ GotCmd
 	andlw	B'00001111'	; match, this is a talk command for the mouse
 	btfsc	STATUS,Z	; "
 	bra	MouseTalk	; "
-	movf	FSR0L,W		;If the UART receiver queue is not empty, we
-	xorwf	FSR1L,W		; need our devices to be polled, so send a
-	btfss	STATUS,Z	; service request
+	movf	FSR0L,W		;If the keyboard queue is not empty or the
+	xorwf	FSR1L,W		; mouse service flag is up, we need our devices
+	btfsc	STATUS,Z	; to be polled, so send a service request
+	btfsc	DV_FLAGS,DV_MSES; "
 	call	ServiceRequest	; "
 	bra	Main
 
@@ -678,9 +622,9 @@ MouseTalk
 	andlw	B'00000011'	; "
 	btfsc	STATUS,Z	; "
 	bra	MouseTalk0	; "
-	addlw	-1		;If this is a talk register 1, handle that
-	btfsc	STATUS,Z	; "
-	bra	MouseTalk1	; "
+	addlw	-1		;If this is a talk register 1, we have no
+	btfsc	STATUS,Z	; handler for that, so done
+	bra	Main		; "
 	addlw	-1		;If this is a talk register 2, we have no
 	btfsc	STATUS,Z	; handler for that, so done
 	bra	Main		; "
@@ -710,14 +654,6 @@ MouseTalk0
 	btfss	DV_FLAGS,DV_MSES;If the mouse doesn't need service, we're done
 	bra	Main		; "
 	bcf	DV_FLAGS,DV_MSES;Clear the mouse-needs-service flag
-	movlb	1		;If our handler ID is set to 4, reply using the
-	movf	MSE_3_L,W	; literal bytes last handed to us by the host,
-	xorlw	4		; else use the classic mouse protocol to hand
-	btfsc	STATUS,Z	; over a delta Y and a delta X
-	bra	MouseTalk0_H4	; "
-	;fall through
-
-MouseTalk0_H1
 MT0Y	movlb	1		;We handle the Y delta differently depending on
 	btfsc	MSE_DYH,7	; whether it's negative or positive
 	bra	MT0YNeg		; "
@@ -783,65 +719,16 @@ MT0XNeg	movlw	0x40		;If it's negative, add 64 to it
 MT0XNMo	movlw	B'01000000'	;If it didn't overflow, send the delta -64 and
 	movwf	ADB_BUF2	; signal that we need to be serviced again to
 	bsf	DV_FLAGS,DV_MSES; convey the rest of it
-MT0Btns	btfsc	MS4_0_1,7	;Copy the mouse button bits from the handler 4
-	bsf	ADB_BUF,7	; data
-	btfsc	MS4_0_2,7	; "
+MT0Btns	btfsc	MSE_BTN,0	;Copy the mouse button bits
+	bsf	ADB_BUF,7	; "
+	btfsc	MSE_BTN,1	; "
 	bsf	ADB_BUF2,7	; "
 	bsf	TX_FLAGS,TX_RDY	;Signal the transmitter that we're ready to
 	bcf	TX_FLAGS,TX_SIZ2; transmit two bytes
 	bcf	TX_FLAGS,TX_SIZ1; "
 	bsf	TX_FLAGS,TX_SIZ0; "
-	movlw	B'11111111'	;Overwrite the bytes for handler 4 register 0
-	movwf	MS4_0_1		; with ones so the mouse buttons can be
-	movwf	MS4_0_2		; released
-	movwf	MS4_0_3		; "
-	movwf	MS4_0_4		; "
-	movwf	MS4_0_5		; "
-	bra	Main
-
-MouseTalk0_H4
-	movf	MS4_0_1,W	;Copy the bytes for register 0 last handed to
-	movwf	ADB_BUF		; us by the host into the ADB buffer
-	movf	MS4_0_2,W	; "
-	movwf	ADB_BUF2	; "
-	movf	MS4_0_3,W	; "
-	movwf	ADB_BUF3	; "
-	movf	MS4_0_4,W	; "
-	movwf	ADB_BUF4	; "
-	movf	MS4_0_5,W	; "
-	movwf	ADB_BUF5	; "
-	movlw	B'11111111'	;Overwrite the bytes for register 0 with ones
-	movwf	MS4_0_1		; so the mouse buttons can be released
-	movwf	MS4_0_2		; "
-	movwf	MS4_0_3		; "
-	movwf	MS4_0_4		; "
-	movwf	MS4_0_5		; "
-	bsf	TX_FLAGS,TX_RDY	;Signal the transmitter that we're ready to
-	bsf	TX_FLAGS,TX_SIZ2; transmit five bytes
-	bcf	TX_FLAGS,TX_SIZ1; "
-	bcf	TX_FLAGS,TX_SIZ0; "
-	bra	Main
-
-MouseTalk1
-	movlb	1		;If our handler ID is not set to 4, we have no
-	movf	MSE_3_L,W	; register 1 to talk, so we're done
-	xorlw	4		; "
-	btfss	STATUS,Z	; "
-	bra	Main		; "
-	movlw	0		;We have no unique identifier as assigned by
-	movwf	ADB_BUF		; Apple, so give all zeroes instead
-	movwf	ADB_BUF2	; "
-	movwf	ADB_BUF3	; "
-	movwf	ADB_BUF4	; "
-	movwf	ADB_BUF5	;Our device resolution is nominally 96 units
-	movlw	96		; per inch, pretend we are a graphics tablet
-	movwf	ADB_BUF6	; the exact size of the mac's monitor
-	movlw	0		;We are a graphics tablet, absolute positioned
-	movwf	ADB_BUF7	; "
-	movlw	8		;And we have 8 buttons
-	movwf	ADB_BUF8	; "
-	movlw	B'10000111'	;Signal that we're ready to transmit 8 bytes
-	iorwf	TX_FLAGS,F	; "
+	movlw	B'11111111'	;Overwrite the mouse button bits with ones so
+	movwf	MSE_BTN		; the mouse buttons can be released
 	bra	Main
 
 MouseTalk3
@@ -940,12 +827,6 @@ MouseListen
 	addlw	2		;If the low byte of the listen register 3 data
 	btfsc	STATUS,Z	; is 0xFE, handle this
 	bra	MouseL3_FE	; "
-	addlw	250		;If the low byte of the listen register 3 data
-	btfsc	STATUS,Z	; is 0x01 or 0x04, these are handler IDs that
-	bra	MouseL3ChgH	; we (as an extended mouse) understand, so
-	addlw	3		; change our handler ID accordingly
-	btfsc	STATUS,Z	; "
-	bra	MouseL3ChgH	; "
 	bra	Main
 
 MouseL3_00
@@ -965,12 +846,6 @@ MouseL3_FE
 	iorwf	ADB_BUF,W	; "
 	movwf	MSE_3_H		; "
 ML3FENo	bcf	DV_FLAGS,DV_MSEC;Clear the collision flag if it was set
-	bra	Main
-
-MouseL3ChgH
-	movf	ADB_BUF2,W	;Change our handler ID (the low byte of
-	movlb	1		; register 3) to the byte given in the listen
-	movwf	MSE_3_L		; register 3 command
 	bra	Main
 
 GotCollision
